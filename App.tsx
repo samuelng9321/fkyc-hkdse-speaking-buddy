@@ -32,6 +32,8 @@ const App: React.FC = () => {
     const analyzerRef = useRef<AnalyserNode | null>(null);
     const animationFrameRef = useRef<number | null>(null);
     const isModelTurnRef = useRef<boolean>(false);
+    const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const isSessionActiveRef = useRef<boolean>(false);
 
     // Fetch API key from serverless endpoint (for production security)
     const fetchApiKey = async (): Promise<string | null> => {
@@ -100,65 +102,7 @@ const App: React.FC = () => {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             streamRef.current = stream;
 
-            // Setup audio processing BEFORE WebSocket connection to avoid race conditions
-            const source = inputCtx.createMediaStreamSource(stream);
-            inputSourceRef.current = source;
-
-            // Try AudioWorklet first, fall back to ScriptProcessor
-            let audioSetupSuccess = false;
-            if (inputCtx.audioWorklet) {
-                try {
-                    await inputCtx.audioWorklet.addModule('/audio-processor.js');
-                    const workletNode = new AudioWorkletNode(inputCtx, 'audio-capture-processor');
-                    workletNodeRef.current = workletNode;
-
-                    workletNode.port.onmessage = (event) => {
-                        if (event.data.type === 'audio') {
-                            if (!isMicOn || audioQueueRef.current.length > 0) return;
-                            if (sessionPromiseRef.current) {
-                                sessionPromiseRef.current.then(session => {
-                                    session.sendRealtimeInput({
-                                        media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
-                                    });
-                                });
-                            }
-                        }
-                    };
-
-                    source.connect(workletNode);
-                    workletNode.connect(inputCtx.destination);
-                    console.log('Using AudioWorkletNode');
-                    audioSetupSuccess = true;
-                } catch (err) {
-                    console.warn('AudioWorklet failed, using fallback:', err);
-                }
-            }
-
-            // Fallback: use ScriptProcessorNode if AudioWorklet failed
-            if (!audioSetupSuccess) {
-                const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-                (workletNodeRef as any).current = processor;
-
-                processor.onaudioprocess = (e) => {
-                    if (!isMicOn || audioQueueRef.current.length > 0) return;
-                    const inputData = e.inputBuffer.getChannelData(0);
-                    const pcm16 = float32ToPCM16(inputData);
-                    if (sessionPromiseRef.current) {
-                        sessionPromiseRef.current.then(session => {
-                            session.sendRealtimeInput({
-                                media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(pcm16.buffer) }
-                            });
-                        });
-                    }
-                };
-
-                source.connect(processor);
-                processor.connect(inputCtx.destination);
-                console.log('Using ScriptProcessorNode (fallback)');
-            }
-
-            // NOW start WebSocket connection (audio is already set up)
-            const ai = new GoogleGenAI({ apiKey: key });
+            const ai = new GoogleGenAI({ apiKey: apiKey });
             const instruction = getSystemInstruction(selectedTopic);
 
             const config = {
@@ -177,8 +121,26 @@ const App: React.FC = () => {
                     onopen: () => {
                         setConnectionState('connected');
                         nextStartTimeRef.current = 0;
+                        isSessionActiveRef.current = true;
 
-                        // SAM STARTS FIRST: Trigger Sam to speak
+                        // Start heartbeat to keep connection alive (every 25 seconds)
+                        heartbeatIntervalRef.current = setInterval(() => {
+                            if (sessionPromiseRef.current && isSessionActiveRef.current) {
+                                sessionPromiseRef.current.then(session => {
+                                    try {
+                                        // Send minimal audio data as heartbeat
+                                        const emptyAudio = new Int16Array(160); // 10ms of silence at 16kHz
+                                        session.sendRealtimeInput({
+                                            media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(emptyAudio.buffer) }
+                                        });
+                                    } catch (err) {
+                                        console.warn('Heartbeat failed:', err);
+                                    }
+                                });
+                            }
+                        }, 25000);
+
+                        // SAM STARTS FIRST: Immediate hidden trigger
                         setTimeout(() => {
                             if (sessionPromiseRef.current) {
                                 sessionPromiseRef.current.then(session => {
@@ -191,6 +153,44 @@ const App: React.FC = () => {
                                 });
                             }
                         }, 100);
+
+                        if (!inputAudioContextRef.current || !streamRef.current) return;
+
+                        // Use AudioWorkletNode instead of deprecated ScriptProcessorNode
+                        const setupAudioWorklet = async () => {
+                            try {
+                                await inputAudioContextRef.current!.audioWorklet.addModule('/audio-processor.js');
+                                const workletNode = new AudioWorkletNode(inputAudioContextRef.current!, 'audio-capture-processor');
+                                workletNodeRef.current = workletNode;
+
+                                const source = inputAudioContextRef.current!.createMediaStreamSource(streamRef.current!);
+                                inputSourceRef.current = source;
+
+                                workletNode.port.onmessage = (event) => {
+                                    if (event.data.type === 'audio') {
+                                        if (!isMicOn || audioQueueRef.current.length > 0) return;
+                                        // Check if session is still active before sending
+                                        if (sessionPromiseRef.current && isSessionActiveRef.current) {
+                                            sessionPromiseRef.current.then(session => {
+                                                try {
+                                                    session.sendRealtimeInput({
+                                                        media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
+                                                    });
+                                                } catch (err) {
+                                                    console.warn('Failed to send audio:', err);
+                                                }
+                                            });
+                                        }
+                                    }
+                                };
+
+                                source.connect(workletNode);
+                                workletNode.connect(inputAudioContextRef.current!.destination);
+                            } catch (err) {
+                                console.error('AudioWorklet setup failed:', err);
+                            }
+                        };
+                        setupAudioWorklet();
                     },
                     onmessage: async (msg: LiveServerMessage) => {
                         const text = msg.serverContent?.outputTranscription?.text;
@@ -273,6 +273,12 @@ const App: React.FC = () => {
     };
 
     const cleanup = () => {
+        // Clear heartbeat interval
+        if (heartbeatIntervalRef.current) {
+            clearInterval(heartbeatIntervalRef.current);
+            heartbeatIntervalRef.current = null;
+        }
+        isSessionActiveRef.current = false;
         if (workletNodeRef.current) { workletNodeRef.current.disconnect(); workletNodeRef.current = null; }
         if (inputSourceRef.current) { inputSourceRef.current.disconnect(); inputSourceRef.current = null; }
         if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }

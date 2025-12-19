@@ -1,0 +1,7 @@
+{
+  "name": "FKYC HKDSE Speaking Buddy",
+  "description": "A voice-interactive roleplay app for practicing HKDSE English discussions with an AI cartoon character. Focuses on using target expressions.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

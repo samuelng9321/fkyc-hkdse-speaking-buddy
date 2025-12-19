@@ -272,12 +272,17 @@ const App: React.FC = () => {
                         }
                     },
                     onclose: (event: any) => {
-                        console.log('WebSocket closed:', event);
+                        console.log('WebSocket closed');
+                        console.log('Close code:', event?.code);
+                        console.log('Close reason:', event?.reason);
+                        console.log('Was clean:', event?.wasClean);
+                        console.log('Full event:', JSON.stringify(event));
                         setConnectionState('disconnected');
                         cleanup();
                     },
                     onerror: (error: any) => {
                         console.error('WebSocket error:', error);
+                        console.error('Error details:', JSON.stringify(error));
                         setConnectionState('error');
                         cleanup();
                     }

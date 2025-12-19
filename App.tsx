@@ -24,7 +24,7 @@ const App: React.FC = () => {
     const inputAudioContextRef = useRef<AudioContext | null>(null);
     const outputAudioContextRef = useRef<AudioContext | null>(null);
     const inputSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-    const processorRef = useRef<ScriptProcessorNode | null>(null);
+    const workletNodeRef = useRef<AudioWorkletNode | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const nextStartTimeRef = useRef<number>(0);
     const sessionPromiseRef = useRef<Promise<any> | null>(null);
@@ -135,25 +135,37 @@ const App: React.FC = () => {
                         }, 100);
 
                         if (!inputAudioContextRef.current || !streamRef.current) return;
-                        const source = inputAudioContextRef.current.createMediaStreamSource(streamRef.current);
-                        inputSourceRef.current = source;
-                        const processor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
-                        processorRef.current = processor;
 
-                        processor.onaudioprocess = (e) => {
-                            if (!isMicOn || audioQueueRef.current.length > 0 || connectionState !== 'connected') return;
-                            const inputData = e.inputBuffer.getChannelData(0);
-                            const pcm16 = float32ToPCM16(inputData);
-                            if (sessionPromiseRef.current) {
-                                sessionPromiseRef.current.then(session => {
-                                    session.sendRealtimeInput({
-                                        media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(pcm16.buffer) }
-                                    });
-                                });
+                        // Use AudioWorkletNode instead of deprecated ScriptProcessorNode
+                        const setupAudioWorklet = async () => {
+                            try {
+                                await inputAudioContextRef.current!.audioWorklet.addModule('/audio-processor.js');
+                                const workletNode = new AudioWorkletNode(inputAudioContextRef.current!, 'audio-capture-processor');
+                                workletNodeRef.current = workletNode;
+
+                                const source = inputAudioContextRef.current!.createMediaStreamSource(streamRef.current!);
+                                inputSourceRef.current = source;
+
+                                workletNode.port.onmessage = (event) => {
+                                    if (event.data.type === 'audio') {
+                                        if (!isMicOn || audioQueueRef.current.length > 0) return;
+                                        if (sessionPromiseRef.current) {
+                                            sessionPromiseRef.current.then(session => {
+                                                session.sendRealtimeInput({
+                                                    media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
+                                                });
+                                            });
+                                        }
+                                    }
+                                };
+
+                                source.connect(workletNode);
+                                workletNode.connect(inputAudioContextRef.current!.destination);
+                            } catch (err) {
+                                console.error('AudioWorklet setup failed:', err);
                             }
                         };
-                        source.connect(processor);
-                        processor.connect(inputAudioContextRef.current.destination);
+                        setupAudioWorklet();
                     },
                     onmessage: async (msg: LiveServerMessage) => {
                         const text = msg.serverContent?.outputTranscription?.text;
@@ -236,7 +248,7 @@ const App: React.FC = () => {
     };
 
     const cleanup = () => {
-        if (processorRef.current) { processorRef.current.disconnect(); processorRef.current = null; }
+        if (workletNodeRef.current) { workletNodeRef.current.disconnect(); workletNodeRef.current = null; }
         if (inputSourceRef.current) { inputSourceRef.current.disconnect(); inputSourceRef.current = null; }
         if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
         if (inputAudioContextRef.current) { inputAudioContextRef.current.close(); inputAudioContextRef.current = null; }
@@ -271,9 +283,9 @@ const App: React.FC = () => {
                     </div>
                     <div className="flex items-center gap-2">
                         <span className={`px-2 py-1 rounded-full text-[10px] font-bold uppercase ${connectionState === 'connected' ? 'bg-green-100 text-green-700' :
-                                connectionState === 'grading' ? 'bg-indigo-100 text-indigo-700' :
-                                    connectionState === 'finished' ? 'bg-blue-100 text-blue-700' :
-                                        'bg-slate-100 text-slate-500'
+                            connectionState === 'grading' ? 'bg-indigo-100 text-indigo-700' :
+                                connectionState === 'finished' ? 'bg-blue-100 text-blue-700' :
+                                    'bg-slate-100 text-slate-500'
                             }`}>
                             {connectionState}
                         </span>

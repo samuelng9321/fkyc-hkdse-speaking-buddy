@@ -136,36 +136,67 @@ const App: React.FC = () => {
 
                         if (!inputAudioContextRef.current || !streamRef.current) return;
 
-                        // Use AudioWorkletNode instead of deprecated ScriptProcessorNode
-                        const setupAudioWorklet = async () => {
-                            try {
-                                await inputAudioContextRef.current!.audioWorklet.addModule('/audio-processor.js');
-                                const workletNode = new AudioWorkletNode(inputAudioContextRef.current!, 'audio-capture-processor');
-                                workletNodeRef.current = workletNode;
+                        // Capture references to avoid null issues in async callback
+                        const inputCtx = inputAudioContextRef.current;
+                        const stream = streamRef.current;
 
-                                const source = inputAudioContextRef.current!.createMediaStreamSource(streamRef.current!);
-                                inputSourceRef.current = source;
+                        // Setup audio processing with fallback for unsupported devices
+                        const setupAudioProcessing = async () => {
+                            const source = inputCtx.createMediaStreamSource(stream);
+                            inputSourceRef.current = source;
 
-                                workletNode.port.onmessage = (event) => {
-                                    if (event.data.type === 'audio') {
-                                        if (!isMicOn || audioQueueRef.current.length > 0) return;
-                                        if (sessionPromiseRef.current) {
-                                            sessionPromiseRef.current.then(session => {
-                                                session.sendRealtimeInput({
-                                                    media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
+                            // Try AudioWorklet first, fall back to ScriptProcessor
+                            if (inputCtx.audioWorklet) {
+                                try {
+                                    await inputCtx.audioWorklet.addModule('/audio-processor.js');
+                                    const workletNode = new AudioWorkletNode(inputCtx, 'audio-capture-processor');
+                                    workletNodeRef.current = workletNode;
+
+                                    workletNode.port.onmessage = (event) => {
+                                        if (event.data.type === 'audio') {
+                                            if (!isMicOn || audioQueueRef.current.length > 0) return;
+                                            if (sessionPromiseRef.current) {
+                                                sessionPromiseRef.current.then(session => {
+                                                    session.sendRealtimeInput({
+                                                        media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
+                                                    });
                                                 });
-                                            });
+                                            }
                                         }
-                                    }
-                                };
+                                    };
 
-                                source.connect(workletNode);
-                                workletNode.connect(inputAudioContextRef.current!.destination);
-                            } catch (err) {
-                                console.error('AudioWorklet setup failed:', err);
+                                    source.connect(workletNode);
+                                    workletNode.connect(inputCtx.destination);
+                                    console.log('Using AudioWorkletNode');
+                                    return;
+                                } catch (err) {
+                                    console.warn('AudioWorklet failed, using fallback:', err);
+                                }
                             }
+
+                            // Fallback: use deprecated ScriptProcessorNode (works on all devices)
+                            const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+                            (workletNodeRef as any).current = processor; // Store for cleanup
+
+                            processor.onaudioprocess = (e) => {
+                                if (!isMicOn || audioQueueRef.current.length > 0) return;
+                                const inputData = e.inputBuffer.getChannelData(0);
+                                const pcm16 = float32ToPCM16(inputData);
+                                if (sessionPromiseRef.current) {
+                                    sessionPromiseRef.current.then(session => {
+                                        session.sendRealtimeInput({
+                                            media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(pcm16.buffer) }
+                                        });
+                                    });
+                                }
+                            };
+
+                            source.connect(processor);
+                            processor.connect(inputCtx.destination);
+                            console.log('Using ScriptProcessorNode (fallback)');
                         };
-                        setupAudioWorklet();
+
+                        setupAudioProcessing();
                     },
                     onmessage: async (msg: LiveServerMessage) => {
                         const text = msg.serverContent?.outputTranscription?.text;

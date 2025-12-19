@@ -95,6 +95,14 @@ const App: React.FC = () => {
             inputAudioContextRef.current = inputCtx;
             outputAudioContextRef.current = outputCtx;
 
+            // Resume AudioContext if suspended (required for iOS Safari)
+            if (inputCtx.state === 'suspended') {
+                await inputCtx.resume();
+            }
+            if (outputCtx.state === 'suspended') {
+                await outputCtx.resume();
+            }
+
             const analyzer = outputCtx.createAnalyser();
             analyzer.fftSize = 256;
             analyzerRef.current = analyzer;
@@ -156,41 +164,76 @@ const App: React.FC = () => {
 
                         if (!inputAudioContextRef.current || !streamRef.current) return;
 
-                        // Use AudioWorkletNode instead of deprecated ScriptProcessorNode
-                        const setupAudioWorklet = async () => {
-                            try {
-                                await inputAudioContextRef.current!.audioWorklet.addModule('/audio-processor.js');
-                                const workletNode = new AudioWorkletNode(inputAudioContextRef.current!, 'audio-capture-processor');
-                                workletNodeRef.current = workletNode;
+                        // Setup audio processing with fallback for mobile browsers
+                        const setupAudioProcessing = async () => {
+                            const ctx = inputAudioContextRef.current!;
+                            const stream = streamRef.current!;
 
-                                const source = inputAudioContextRef.current!.createMediaStreamSource(streamRef.current!);
-                                inputSourceRef.current = source;
+                            const source = ctx.createMediaStreamSource(stream);
+                            inputSourceRef.current = source;
 
-                                workletNode.port.onmessage = (event) => {
-                                    if (event.data.type === 'audio') {
-                                        if (!isMicOn || audioQueueRef.current.length > 0) return;
-                                        // Check if session is still active before sending
-                                        if (sessionPromiseRef.current && isSessionActiveRef.current) {
-                                            sessionPromiseRef.current.then(session => {
-                                                try {
-                                                    session.sendRealtimeInput({
-                                                        media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
-                                                    });
-                                                } catch (err) {
-                                                    console.warn('Failed to send audio:', err);
-                                                }
-                                            });
+                            // Try AudioWorklet first (modern browsers), fallback to ScriptProcessor (mobile/older)
+                            if (ctx.audioWorklet) {
+                                try {
+                                    await ctx.audioWorklet.addModule('/audio-processor.js');
+                                    const workletNode = new AudioWorkletNode(ctx, 'audio-capture-processor');
+                                    workletNodeRef.current = workletNode;
+
+                                    workletNode.port.onmessage = (event) => {
+                                        if (event.data.type === 'audio') {
+                                            if (!isMicOn || audioQueueRef.current.length > 0) return;
+                                            if (sessionPromiseRef.current && isSessionActiveRef.current) {
+                                                sessionPromiseRef.current.then(session => {
+                                                    try {
+                                                        session.sendRealtimeInput({
+                                                            media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
+                                                        });
+                                                    } catch (err) {
+                                                        console.warn('Failed to send audio:', err);
+                                                    }
+                                                });
+                                            }
                                         }
-                                    }
-                                };
+                                    };
 
-                                source.connect(workletNode);
-                                workletNode.connect(inputAudioContextRef.current!.destination);
-                            } catch (err) {
-                                console.error('AudioWorklet setup failed:', err);
+                                    source.connect(workletNode);
+                                    workletNode.connect(ctx.destination);
+                                    console.log('Using AudioWorkletNode');
+                                    return;
+                                } catch (err) {
+                                    console.warn('AudioWorklet failed, falling back to ScriptProcessor:', err);
+                                }
                             }
+
+                            // Fallback: ScriptProcessorNode (works on more mobile browsers)
+                            console.log('Using ScriptProcessorNode (fallback)');
+                            const processor = ctx.createScriptProcessor(4096, 1, 1);
+
+                            processor.onaudioprocess = (e) => {
+                                if (!isMicOn || audioQueueRef.current.length > 0) return;
+                                if (sessionPromiseRef.current && isSessionActiveRef.current) {
+                                    const inputData = e.inputBuffer.getChannelData(0);
+                                    const int16 = new Int16Array(inputData.length);
+                                    for (let i = 0; i < inputData.length; i++) {
+                                        const s = Math.max(-1, Math.min(1, inputData[i]));
+                                        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                                    }
+                                    sessionPromiseRef.current.then(session => {
+                                        try {
+                                            session.sendRealtimeInput({
+                                                media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(int16.buffer) }
+                                            });
+                                        } catch (err) {
+                                            console.warn('Failed to send audio:', err);
+                                        }
+                                    });
+                                }
+                            };
+
+                            source.connect(processor);
+                            processor.connect(ctx.destination);
                         };
-                        setupAudioWorklet();
+                        setupAudioProcessing();
                     },
                     onmessage: async (msg: LiveServerMessage) => {
                         const text = msg.serverContent?.outputTranscription?.text;

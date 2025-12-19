@@ -100,6 +100,64 @@ const App: React.FC = () => {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             streamRef.current = stream;
 
+            // Setup audio processing BEFORE WebSocket connection to avoid race conditions
+            const source = inputCtx.createMediaStreamSource(stream);
+            inputSourceRef.current = source;
+
+            // Try AudioWorklet first, fall back to ScriptProcessor
+            let audioSetupSuccess = false;
+            if (inputCtx.audioWorklet) {
+                try {
+                    await inputCtx.audioWorklet.addModule('/audio-processor.js');
+                    const workletNode = new AudioWorkletNode(inputCtx, 'audio-capture-processor');
+                    workletNodeRef.current = workletNode;
+
+                    workletNode.port.onmessage = (event) => {
+                        if (event.data.type === 'audio') {
+                            if (!isMicOn || audioQueueRef.current.length > 0) return;
+                            if (sessionPromiseRef.current) {
+                                sessionPromiseRef.current.then(session => {
+                                    session.sendRealtimeInput({
+                                        media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
+                                    });
+                                });
+                            }
+                        }
+                    };
+
+                    source.connect(workletNode);
+                    workletNode.connect(inputCtx.destination);
+                    console.log('Using AudioWorkletNode');
+                    audioSetupSuccess = true;
+                } catch (err) {
+                    console.warn('AudioWorklet failed, using fallback:', err);
+                }
+            }
+
+            // Fallback: use ScriptProcessorNode if AudioWorklet failed
+            if (!audioSetupSuccess) {
+                const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+                (workletNodeRef as any).current = processor;
+
+                processor.onaudioprocess = (e) => {
+                    if (!isMicOn || audioQueueRef.current.length > 0) return;
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const pcm16 = float32ToPCM16(inputData);
+                    if (sessionPromiseRef.current) {
+                        sessionPromiseRef.current.then(session => {
+                            session.sendRealtimeInput({
+                                media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(pcm16.buffer) }
+                            });
+                        });
+                    }
+                };
+
+                source.connect(processor);
+                processor.connect(inputCtx.destination);
+                console.log('Using ScriptProcessorNode (fallback)');
+            }
+
+            // NOW start WebSocket connection (audio is already set up)
             const ai = new GoogleGenAI({ apiKey: key });
             const instruction = getSystemInstruction(selectedTopic);
 
@@ -120,7 +178,7 @@ const App: React.FC = () => {
                         setConnectionState('connected');
                         nextStartTimeRef.current = 0;
 
-                        // SAM STARTS FIRST: Immediate hidden trigger
+                        // SAM STARTS FIRST: Trigger Sam to speak
                         setTimeout(() => {
                             if (sessionPromiseRef.current) {
                                 sessionPromiseRef.current.then(session => {
@@ -133,70 +191,6 @@ const App: React.FC = () => {
                                 });
                             }
                         }, 100);
-
-                        if (!inputAudioContextRef.current || !streamRef.current) return;
-
-                        // Capture references to avoid null issues in async callback
-                        const inputCtx = inputAudioContextRef.current;
-                        const stream = streamRef.current;
-
-                        // Setup audio processing with fallback for unsupported devices
-                        const setupAudioProcessing = async () => {
-                            const source = inputCtx.createMediaStreamSource(stream);
-                            inputSourceRef.current = source;
-
-                            // Try AudioWorklet first, fall back to ScriptProcessor
-                            if (inputCtx.audioWorklet) {
-                                try {
-                                    await inputCtx.audioWorklet.addModule('/audio-processor.js');
-                                    const workletNode = new AudioWorkletNode(inputCtx, 'audio-capture-processor');
-                                    workletNodeRef.current = workletNode;
-
-                                    workletNode.port.onmessage = (event) => {
-                                        if (event.data.type === 'audio') {
-                                            if (!isMicOn || audioQueueRef.current.length > 0) return;
-                                            if (sessionPromiseRef.current) {
-                                                sessionPromiseRef.current.then(session => {
-                                                    session.sendRealtimeInput({
-                                                        media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(event.data.data) }
-                                                    });
-                                                });
-                                            }
-                                        }
-                                    };
-
-                                    source.connect(workletNode);
-                                    workletNode.connect(inputCtx.destination);
-                                    console.log('Using AudioWorkletNode');
-                                    return;
-                                } catch (err) {
-                                    console.warn('AudioWorklet failed, using fallback:', err);
-                                }
-                            }
-
-                            // Fallback: use deprecated ScriptProcessorNode (works on all devices)
-                            const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-                            (workletNodeRef as any).current = processor; // Store for cleanup
-
-                            processor.onaudioprocess = (e) => {
-                                if (!isMicOn || audioQueueRef.current.length > 0) return;
-                                const inputData = e.inputBuffer.getChannelData(0);
-                                const pcm16 = float32ToPCM16(inputData);
-                                if (sessionPromiseRef.current) {
-                                    sessionPromiseRef.current.then(session => {
-                                        session.sendRealtimeInput({
-                                            media: { mimeType: 'audio/pcm;rate=16000', data: arrayBufferToBase64(pcm16.buffer) }
-                                        });
-                                    });
-                                }
-                            };
-
-                            source.connect(processor);
-                            processor.connect(inputCtx.destination);
-                            console.log('Using ScriptProcessorNode (fallback)');
-                        };
-
-                        setupAudioProcessing();
                     },
                     onmessage: async (msg: LiveServerMessage) => {
                         const text = msg.serverContent?.outputTranscription?.text;

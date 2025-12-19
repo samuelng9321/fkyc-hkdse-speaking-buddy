@@ -100,7 +100,7 @@ const App: React.FC = () => {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             streamRef.current = stream;
 
-            const ai = new GoogleGenAI({ apiKey: apiKey });
+            const ai = new GoogleGenAI({ apiKey: key });
             const instruction = getSystemInstruction(selectedTopic);
 
             const config = {

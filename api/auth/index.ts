@@ -29,21 +29,35 @@ function checkRateLimit(key: string): boolean {
 }
 
 function isValidOrigin(req: VercelRequest): boolean {
-  const origin = req.headers.origin || req.headers.referer || '';
-  const allowedOrigins = [
-    'http://localhost:3000',
-    'http://localhost:4173',
-    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '',
-    process.env.PRODUCTION_URL || '',
-  ].filter(Boolean);
+  const origin = req.headers.origin || '';
+  const referer = req.headers.referer || '';
 
-  // In development, allow all origins
-  if (process.env.NODE_ENV === 'development') {
+  // If no origin header, likely same-origin request (not CORS)
+  if (!origin) {
     return true;
   }
 
-  // Check if origin matches any allowed origins
-  return allowedOrigins.some(allowed => origin.startsWith(allowed));
+  // Allow localhost for development
+  if (origin.includes('localhost')) {
+    return true;
+  }
+
+  // Allow any Vercel deployment URL
+  if (origin.includes('.vercel.app')) {
+    return true;
+  }
+
+  // Allow custom production URL if set
+  if (process.env.PRODUCTION_URL && origin.startsWith(process.env.PRODUCTION_URL)) {
+    return true;
+  }
+
+  // Check referer as fallback
+  if (referer.includes('.vercel.app') || referer.includes('localhost')) {
+    return true;
+  }
+
+  return false;
 }
 
 export default function handler(req: VercelRequest, res: VercelResponse) {
@@ -81,7 +95,7 @@ export default function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // Return the API key
-  return res.status(200).json({ 
+  return res.status(200).json({
     key: apiKey,
     expiresIn: 3600 // Hint to client: consider refreshing after 1 hour
   });
